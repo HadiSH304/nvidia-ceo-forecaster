@@ -1,54 +1,104 @@
-#!/usr/bin/env python3
-"""NVIDIA CEO price forecaster - empirical per-market volatility, subdiffusive spread.
+import sys
+import json
+import math
 
-q_tau = clamp(x + z_tau * sigma * h^0.35)
-sigma = shrink(clip-robust std of last-480-minute moves, baseline 0.0025) * 1.1
-"""
-import json, math, os, glob
-
-ZS = [-1.6448536269514722, -0.6744897501960817, 0.0, 0.6744897501960817, 1.6448536269514722]
-QS = [0.05, 0.25, 0.5, 0.75, 0.95]
-
-WIN = 480
-CLIP_MULT = 1.5
-SHRINK_N = 100
-SIGMA_MULT = 1.1
-EXP = 0.35
+# Standard normal quantiles for [0.05, 0.25, 0.5, 0.75, 0.95]
+Z_SCORES = [
+    -1.6448536269514722,
+    -0.6744897501960817,
+    0.0,
+    0.6744897501960817,
+    1.6448536269514722
+]
 
 def sigma_emp(prices):
-    p = prices
-    w = p[-WIN:] if len(p) >= WIN else p
-    if len(w) < 30:
+    """Estimate robust volatility from the last 480 minute price moves."""
+    # Compute all price changes
+    if len(prices) < 2:
         return 0.0025
-    moves = [w[i] - w[i-1] for i in range(1, len(w))]
-    am = sorted(abs(t) for t in moves)
-    clip = max(am[int(0.95 * len(am))] * CLIP_MULT, 0.001)
-    cm = [min(max(t, -clip), clip) for t in moves]
-    mu = sum(cm) / len(cm)
-    var = sum((t - mu) ** 2 for t in cm) / max(1, len(cm) - 1)
-    sigma = math.sqrt(var)
-    wgt = len(w) / (len(w) + SHRINK_N)
-    sigma = wgt * sigma + (1 - wgt) * 0.0025
-    return min(max(sigma * SIGMA_MULT, 0.0005), 0.08)
+    changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+    # Take the last 480 changes (or as many as available)
+    changes = changes[-480:]
+    n = len(changes)
+    # If fewer than 30 points, return floor value
+    if n < 30:
+        return 0.0025
+    # Compute 95th percentile of absolute changes
+    abs_changes = [abs(c) for c in changes]
+    abs_changes_sorted = sorted(abs_changes)
+    # 95th percentile index (using ceiling method)
+    idx = int(math.ceil(0.95 * n)) - 1
+    if idx >= n:
+        idx = n - 1
+    p95 = abs_changes_sorted[idx]
+    # Clip changes at 1.5 * p95
+    clip_val = 1.5 * p95
+    clipped = [max(min(c, clip_val), -clip_val) for c in changes]
+    # Sample standard deviation of clipped changes
+    mean_clipped = sum(clipped) / n
+    variance = sum((c - mean_clipped) ** 2 for c in clipped) / (n - 1)
+    std = math.sqrt(variance)
+    # Floor at 0.001
+    std = max(std, 0.001)
+    # Shrink toward 0.0025 with weight n/(n+100)
+    weight = n / (n + 100)
+    sigma = weight * std + (1 - weight) * 0.0025
+    # Multiply by 1.1
+    sigma *= 1.1
+    # Clamp to [0.0005, 0.08]
+    sigma = max(min(sigma, 0.08), 0.0005)
+    return sigma
+
+def predict_market(prices):
+    """Return 240x5 quantile predictions for a single market."""
+    current_price = prices[-1]
+    sigma = sigma_emp(prices)
+    predictions = []
+    for h in range(1, 241):  # 1 to 240 minutes ahead
+        spread = sigma * (h ** 0.35)
+        minute_preds = []
+        for z in Z_SCORES:
+            pred = current_price + spread * z
+            # Clip to [0, 1]
+            pred = max(min(pred, 1.0), 0.0)
+            minute_preds.append(pred)
+        predictions.append(minute_preds)
+    return predictions
 
 def main():
-    indir = os.environ.get('MAKEFUN_INPUT_DIR', '/input')
-    outdir = os.environ.get('MAKEFUN_OUTPUT_DIR', '/output')
-    os.makedirs(outdir, exist_ok=True)
-    for path in sorted(glob.glob(os.path.join(indir, '*.in'))):
-        case = json.load(open(path))
-        cid = case['case']
-        forecasts = []
-        for m in case['markets']:
-            x = m['prices'][-1]
-            sig = sigma_emp(m['prices'])
-            q = []
-            for h in range(1, 241):
-                s = sig * (h ** EXP)
-                q.append([max(0.0, min(1.0, x + z * s)) for z in ZS])
-            forecasts.append({'id': m['id'], 'q': q})
-        with open(os.path.join(outdir, f'{cid}.out'), 'w') as f:
-            json.dump({'forecasts': forecasts}, f, separators=(',', ':'))
+    # Read input from stdin or file
+    if len(sys.argv) > 1:
+        with open(sys.argv[1], 'r') as f:
+            data = json.load(f)
+    else:
+        data = json.load(sys.stdin)
 
-if __name__ == '__main__':
+    # Parse markets: expect list of dicts with "id" and "prices", or dict with "markets" key
+    markets = []  # list of (id, prices)
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "id" in item and "prices" in item:
+                markets.append((item["id"], item["prices"]))
+    elif isinstance(data, dict) and "markets" in data:
+        for item in data["markets"]:
+            if isinstance(item, dict) and "id" in item and "prices" in item:
+                markets.append((item["id"], item["prices"]))
+    elif isinstance(data, dict) and "id" in data and "prices" in data:
+        markets.append((data["id"], data["prices"]))
+
+    forecasts = []
+    for market_id, prices in markets:
+        if len(prices) == 0:
+            # No prices, produce flat predictions at 0.0? But spec doesn't define. Use 0.0.
+            current_price = 0.0
+        else:
+            current_price = prices[-1]
+        # If not enough prices for any changes, sigma_emp will return 0.0025 (since n<30)
+        preds = predict_market(prices)
+        forecasts.append({"id": market_id, "q": preds})
+
+    # Output as JSON object with "forecasts" key
+    json.dump({"forecasts": forecasts}, sys.stdout)
+
+if __name__ == "__main__":
     main()
